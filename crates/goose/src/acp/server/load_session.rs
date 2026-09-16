@@ -261,7 +261,7 @@ impl GooseAcpAgent {
             session_id,
             run_id.clone(),
             cancel_token.clone(),
-            agent.clone(),
+            Some(agent.clone()),
         )
         .await?;
 

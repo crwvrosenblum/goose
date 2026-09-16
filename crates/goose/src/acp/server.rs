@@ -114,6 +114,8 @@ mod manage_sessions;
 mod message_meta;
 mod new_session;
 mod onboarding;
+#[cfg(test)]
+mod prompt_tests;
 mod prompts;
 mod providers;
 mod recipe;
@@ -242,8 +244,9 @@ pub struct ActivePromptRun {
     cancel_token: CancellationToken,
     /// The agent actually running this prompt. Roaming gives each connection
     /// its own agent, so a steer arriving on a second connection must be
-    /// routed here rather than to the caller's connection-local agent.
-    agent: Arc<Agent>,
+    /// routed here rather than to the caller's connection-local agent. Pending
+    /// prompts reserve cancellation before their agent has been activated.
+    agent: Option<Arc<Agent>>,
 }
 
 struct AgentStreamOutcome {
@@ -286,7 +289,7 @@ impl Drop for ActiveRunDropGuard {
                     let mut runs = registry.lock().await;
                     match runs.get(&session_id) {
                         Some(run) if run.run_id == run_id => {
-                            runs.remove(&session_id).map(|run| run.agent)
+                            runs.remove(&session_id).and_then(|run| run.agent)
                         }
                         _ => None,
                     }
@@ -847,7 +850,7 @@ impl GooseAcpAgent {
         run_id: String,
         agent: Arc<Agent>,
     ) -> Result<(), agent_client_protocol::Error> {
-        self.start_active_run(session_id, run_id, CancellationToken::new(), agent)
+        self.start_active_run(session_id, run_id, CancellationToken::new(), Some(agent))
             .await
     }
 
@@ -1908,7 +1911,7 @@ impl GooseAcpAgent {
         session_id: &str,
         run_id: String,
         cancel_token: CancellationToken,
-        agent: Arc<Agent>,
+        agent: Option<Arc<Agent>>,
     ) -> Result<(), agent_client_protocol::Error> {
         if self.closed_session_ids.lock().await.contains(session_id) {
             return Err(agent_client_protocol::Error::resource_not_found(Some(
@@ -1936,6 +1939,43 @@ impl GooseAcpAgent {
         Ok(())
     }
 
+    async fn reserve_prompt_run(
+        &self,
+        session_id: &str,
+    ) -> Result<ActiveRunDropGuard, agent_client_protocol::Error> {
+        let run = ActiveRunDropGuard {
+            registry: self.active_prompt_runs.clone(),
+            session_id: session_id.to_string(),
+            run_id: format!("run_{}", Uuid::new_v4()),
+            cancel_token: CancellationToken::new(),
+        };
+        self.start_active_run(
+            session_id,
+            run.run_id.clone(),
+            run.cancel_token.clone(),
+            None,
+        )
+        .await?;
+        Ok(run)
+    }
+
+    async fn attach_active_run_agent(
+        &self,
+        run: &ActiveRunDropGuard,
+        agent: Arc<Agent>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let mut runs = self.active_prompt_runs.lock().await;
+        let active_run = runs
+            .get_mut(&run.session_id)
+            .filter(|active_run| active_run.run_id == run.run_id)
+            .ok_or_else(|| {
+                agent_client_protocol::Error::internal_error()
+                    .data("active prompt run changed during startup")
+            })?;
+        active_run.agent = Some(agent);
+        Ok(())
+    }
+
     async fn clear_active_run(&self, session_id: &str, run_id: &str) {
         let agent = {
             let mut active_prompt_runs = self.active_prompt_runs.lock().await;
@@ -1949,7 +1989,7 @@ impl GooseAcpAgent {
 
             active_prompt_runs
                 .remove(session_id)
-                .map(|active_run| active_run.agent)
+                .and_then(|active_run| active_run.agent)
         };
 
         // Discard steers on the agent that owned the run; under roaming it may
@@ -2000,7 +2040,10 @@ impl GooseAcpAgent {
                 })),
             );
         }
-        Ok((active_run.run_id.clone(), active_run.agent.clone()))
+        let agent = active_run.agent.clone().ok_or_else(|| {
+            agent_client_protocol::Error::invalid_params().data("active run is still starting")
+        })?;
+        Ok((active_run.run_id.clone(), agent))
     }
 
     fn active_run_meta(active_run_id: Option<&str>) -> Meta {
@@ -2294,34 +2337,31 @@ impl GooseAcpAgent {
         &self,
         cx: &ConnectionTo<Client>,
         args: PromptRequest,
+        run: ActiveRunDropGuard,
     ) -> Result<PromptResponse, agent_client_protocol::Error> {
         // The ACP session_id IS the thread ID.
         let session_id = args.session_id.0.to_string();
 
-        let run_id = format!("run_{}", Uuid::new_v4());
-        let cancel_token = CancellationToken::new();
+        let run_id = run.run_id.clone();
+        let cancel_token = run.cancel_token.clone();
 
-        // Resolve the agent before claiming the run so the registry can record
-        // which agent owns it; registration stays atomic, so the cross-connection
-        // guard still admits only one run per session.
-        let agent = self.get_session_agent(&session_id).await?;
-        self.start_active_run(
-            &session_id,
-            run_id.clone(),
-            cancel_token.clone(),
-            agent.clone(),
-        )
-        .await?;
+        if cancel_token.is_cancelled() {
+            self.clear_active_run(&session_id, &run_id).await;
+            Self::send_active_run_update(cx, &args.session_id, None)?;
+            return Ok(PromptResponse::new(StopReason::Cancelled));
+        }
 
-        // Frees the run if this future is dropped mid-prompt (e.g. the roaming
-        // connection carrying it is revoked or lost); a normal completion's
-        // explicit clear wins and makes the guard's cleanup a no-op.
-        let _run_guard = ActiveRunDropGuard {
-            registry: self.active_prompt_runs.clone(),
-            session_id: session_id.clone(),
-            run_id: run_id.clone(),
-            cancel_token: cancel_token.clone(),
+        let agent = match self.get_session_agent(&session_id).await {
+            Ok(agent) => agent,
+            Err(error) => {
+                self.clear_active_run(&session_id, &run_id).await;
+                return Err(error);
+            }
         };
+        if let Err(error) = self.attach_active_run_agent(&run, agent.clone()).await {
+            self.clear_active_run(&session_id, &run_id).await;
+            return Err(error);
+        }
 
         if cancel_token.is_cancelled() {
             self.clear_active_run(&session_id, &run_id).await;
